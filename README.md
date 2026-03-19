@@ -104,7 +104,7 @@ What is not implemented yet:
 Run from this repository:
 
 ```bash
-cd /Users/yousufkhan/personal_projects/codemem
+cd /Users/[username]/personal_projects/codemem
 ```
 
 Index a target repository:
