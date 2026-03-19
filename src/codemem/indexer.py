@@ -2,38 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import re
-from dataclasses import dataclass, field
+from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
 
+from codemem.analyzers import ANALYZERS, SUPPORTED_EXTENSIONS, discover_source_files
+from codemem.analyzers.base import FileAnalysis
 from codemem.models import Edge, Entity, RepositoryMemory
-
-SUPPORTED_EXTENSIONS = {
-    ".ts": "typescript",
-    ".tsx": "typescript",
-    ".js": "javascript",
-    ".jsx": "javascript",
-    ".mjs": "javascript",
-    ".cjs": "javascript",
-    ".py": "python",
-}
-
-IGNORED_DIRS = {
-    ".codemem",
-    ".git",
-    ".next",
-    ".nuxt",
-    ".venv",
-    ".yarn",
-    ".turbo",
-    "__pycache__",
-    "build",
-    "coverage",
-    "dist",
-    "node_modules",
-    "out",
-    "target",
-}
 
 STOPWORDS = {
     "and",
@@ -58,347 +33,180 @@ STOPWORDS = {
     "utils",
 }
 
-JS_IMPORT_RE = re.compile(
-    r"""^\s*(?:import|export)\s+(?P<clause>.+?)\s+from\s+['"](?P<module>[^'"]+)['"]""",
-    re.MULTILINE,
-)
-JS_REQUIRE_RE = re.compile(
-    r"""^\s*(?:const|let|var)\s+(?P<name>[A-Za-z_$][\w$]*)\s*=\s*require\(['"](?P<module>[^'"]+)['"]\)""",
-    re.MULTILINE,
-)
-PY_IMPORT_RE = re.compile(r"""^\s*import\s+(?P<module>[A-Za-z0-9_.,\s]+)""", re.MULTILINE)
-PY_FROM_IMPORT_RE = re.compile(
-    r"""^\s*from\s+(?P<module>[A-Za-z0-9_.]+)\s+import\s+(?P<names>[A-Za-z0-9_*,\s]+)""",
-    re.MULTILINE,
-)
-
-JS_FUNCTION_RE = re.compile(
-    r"""^\s*(?:export\s+)?(?:async\s+)?function\s+(?P<name>[A-Za-z_$][\w$]*)\s*\((?P<signature>[^)]*)\)""",
-    re.MULTILINE,
-)
-JS_ARROW_RE = re.compile(
-    r"""^\s*(?:export\s+)?(?:const|let|var)\s+(?P<name>[A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?P<signature>\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>""",
-    re.MULTILINE,
-)
-JS_FUNCTION_EXPR_RE = re.compile(
-    r"""^\s*(?:export\s+)?(?:const|let|var)\s+(?P<name>[A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?function\s*\((?P<signature>[^)]*)\)""",
-    re.MULTILINE,
-)
-JS_CLASS_RE = re.compile(
-    r"""^\s*(?:export\s+)?class\s+(?P<name>[A-Za-z_$][\w$]*)""",
-    re.MULTILINE,
-)
-PY_FUNCTION_RE = re.compile(
-    r"""^\s*(?:async\s+)?def\s+(?P<name>[A-Za-z_]\w*)\s*\((?P<signature>[^)]*)\)""",
-    re.MULTILINE,
-)
-PY_CLASS_RE = re.compile(r"""^\s*class\s+(?P<name>[A-Za-z_]\w*)""", re.MULTILINE)
 CALL_RE_TEMPLATE = r"""\b{symbol}\s*\("""
-
-
-@dataclass(slots=True)
-class ImportReference:
-    specifier: str
-    names: list[str]
-    resolved_path: str | None = None
-
-
-@dataclass(slots=True)
-class RawSymbol:
-    kind: str
-    name: str
-    signature: str
-    start_offset: int
-    end_offset: int = 0
-    start_line: int = 0
-    end_line: int = 0
-    body: str = ""
-
-
-@dataclass(slots=True)
-class IndexedFile:
-    entity: Entity
-    text: str
-    imports: list[ImportReference] = field(default_factory=list)
-    symbols: list[RawSymbol] = field(default_factory=list)
 
 
 def index_repository(repo_root: str | Path) -> RepositoryMemory:
     root = Path(repo_root).resolve()
-    indexed_files: list[IndexedFile] = []
-
-    for file_path in _discover_files(root):
-        relative_path = file_path.relative_to(root).as_posix()
-        language = SUPPORTED_EXTENSIONS[file_path.suffix]
-        text = file_path.read_text(encoding="utf-8", errors="ignore")
-        file_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
-        file_entity = Entity(
-            id=f"file:{relative_path}",
-            kind="File",
-            name=file_path.name,
-            path=relative_path,
-            language=language,
-            summary=_summarize_file(relative_path, language, text),
-            tags=_derive_tags(relative_path, file_path.stem),
-            hash=file_hash,
-            metadata={"size": len(text), "suffix": file_path.suffix},
-        )
-        indexed_files.append(
-            IndexedFile(
-                entity=file_entity,
-                text=text,
-                imports=_extract_imports(text, language),
-                symbols=_extract_symbols(text, language),
-            )
-        )
+    file_paths = discover_source_files(root)
+    analyses = [_analyze_file(root, file_path) for file_path in file_paths]
 
     entities: list[Entity] = []
     edges: list[Edge] = []
-    entities_by_path: dict[str, Entity] = {}
-    symbols_by_file: dict[str, list[Entity]] = {}
+    file_entities_by_path: dict[str, Entity] = {}
+    symbol_entities_by_file: dict[str, list[Entity]] = {}
+    analysis_by_path = {analysis.relative_path: analysis for analysis in analyses}
 
-    for indexed_file in indexed_files:
-        entities.append(indexed_file.entity)
-        entities_by_path[indexed_file.entity.path] = indexed_file.entity
+    for analysis in analyses:
+        file_entity = _build_file_entity(analysis)
+        file_entities_by_path[analysis.relative_path] = file_entity
+        entities.append(file_entity)
 
-        raw_symbols = sorted(indexed_file.symbols, key=lambda symbol: symbol.start_offset)
-        for position, symbol in enumerate(raw_symbols):
-            next_offset = len(indexed_file.text)
-            if position + 1 < len(raw_symbols):
-                next_offset = raw_symbols[position + 1].start_offset
-            end_offset = min(next_offset, len(indexed_file.text))
-            if symbol.end_offset:
-                end_offset = min(symbol.end_offset, end_offset)
-            symbol.end_offset = max(end_offset, symbol.start_offset)
-            symbol.body = indexed_file.text[symbol.start_offset : symbol.end_offset]
-            symbol.start_line = _line_number(indexed_file.text, symbol.start_offset)
-            symbol.end_line = _line_number(indexed_file.text, symbol.end_offset)
-
-            entity = Entity(
-                id=f"{symbol.kind.lower()}:{indexed_file.entity.path}:{symbol.name}:{symbol.start_line}",
-                kind=symbol.kind,
-                name=symbol.name,
-                path=indexed_file.entity.path,
-                language=indexed_file.entity.language,
-                start_line=symbol.start_line,
-                end_line=symbol.end_line,
-                signature=symbol.signature,
-                summary=_summarize_symbol(symbol, indexed_file.entity.path),
-                tags=_derive_tags(indexed_file.entity.path, symbol.name),
-                hash=hashlib.sha256(symbol.body.encode("utf-8")).hexdigest(),
-                metadata={"parent_file": indexed_file.entity.id},
-            )
+    for analysis in analyses:
+        file_entity = file_entities_by_path[analysis.relative_path]
+        for symbol in analysis.symbols:
+            entity = _build_symbol_entity(file_entity, symbol)
             entities.append(entity)
-            symbols_by_file.setdefault(indexed_file.entity.path, []).append(entity)
+            symbol_entities_by_file.setdefault(analysis.relative_path, []).append(entity)
             edges.append(
                 Edge(
-                    source=indexed_file.entity.id,
+                    source=file_entity.id,
                     target=entity.id,
                     kind="CONTAINS",
+                    provenance="analyzer.contains",
                 )
             )
-
-    symbol_names_by_file: dict[str, dict[str, Entity]] = {
-        path: {entity.name: entity for entity in file_symbols}
-        for path, file_symbols in symbols_by_file.items()
-    }
-
-    for indexed_file in indexed_files:
-        for import_ref in indexed_file.imports:
-            resolved_path = _resolve_import(indexed_file.entity.path, import_ref.specifier, root)
-            import_ref.resolved_path = resolved_path
-            if resolved_path and resolved_path in entities_by_path:
+            if entity.exported:
                 edges.append(
                     Edge(
-                        source=indexed_file.entity.id,
-                        target=entities_by_path[resolved_path].id,
-                        kind="IMPORTS",
-                        metadata={"specifier": import_ref.specifier},
+                        source=file_entity.id,
+                        target=entity.id,
+                        kind="EXPORTS",
+                        provenance="analyzer.exports",
                     )
                 )
 
-        local_symbols = symbol_names_by_file.get(indexed_file.entity.path, {})
-        related_symbols = dict(local_symbols)
+    symbol_names_by_file = {
+        path: {entity.name: entity for entity in file_symbols}
+        for path, file_symbols in symbol_entities_by_file.items()
+    }
 
-        for import_ref in indexed_file.imports:
+    for analysis in analyses:
+        file_entity = file_entities_by_path[analysis.relative_path]
+        for import_ref in analysis.imports:
+            resolved_path = _resolve_import(analysis.relative_path, import_ref.specifier, root, analysis.language)
+            import_ref.resolved_path = resolved_path
+            if resolved_path and resolved_path in file_entities_by_path:
+                edges.append(
+                    Edge(
+                        source=file_entity.id,
+                        target=file_entities_by_path[resolved_path].id,
+                        kind="IMPORTS",
+                        provenance="analyzer.imports",
+                        metadata={
+                            "specifier": import_ref.specifier,
+                            "names": import_ref.names,
+                            "import_kind": import_ref.import_kind,
+                        },
+                    )
+                )
+
+        local_symbols = symbol_names_by_file.get(analysis.relative_path, {})
+        related_symbols = dict(local_symbols)
+        for import_ref in analysis.imports:
             if not import_ref.resolved_path:
                 continue
-            imported_entities = symbol_names_by_file.get(import_ref.resolved_path, {})
+            imported_symbols = symbol_names_by_file.get(import_ref.resolved_path, {})
             for name in import_ref.names:
-                if name in imported_entities:
-                    related_symbols[name] = imported_entities[name]
+                if name in imported_symbols:
+                    related_symbols[name] = imported_symbols[name]
 
-        for raw_symbol in indexed_file.symbols:
-            source_entity_id = f"{raw_symbol.kind.lower()}:{indexed_file.entity.path}:{raw_symbol.name}:{_line_number(indexed_file.text, raw_symbol.start_offset)}"
+        for symbol in analysis.symbols:
+            source_entity_id = _entity_id(symbol.kind, analysis.relative_path, symbol.name, symbol.span.start_line)
             for candidate_name, target_entity in related_symbols.items():
-                if candidate_name == raw_symbol.name:
+                if candidate_name == symbol.name:
                     continue
-                call_re = re.compile(CALL_RE_TEMPLATE.format(symbol=re.escape(candidate_name)))
-                if call_re.search(raw_symbol.body):
+                if re.search(CALL_RE_TEMPLATE.format(symbol=re.escape(candidate_name)), symbol.body):
                     edges.append(
                         Edge(
                             source=source_entity_id,
                             target=target_entity.id,
                             kind="CALLS",
+                            provenance="analyzer.calls",
+                            confidence=0.7,
+                            metadata={"via": candidate_name},
                         )
                     )
 
     deduped_edges = _dedupe_edges(edges)
+    language_counts = Counter(analysis.language for analysis in analyses)
+    diagnostics_count = sum(len(analysis.diagnostics) for analysis in analyses)
+    analyzers = {
+        analysis.language: f"{ANALYZERS[analysis.language].name}@{ANALYZERS[analysis.language].version}"
+        for analysis in analyses
+    }
     stats = {
-        "files_indexed": len(indexed_files),
+        "files_indexed": len(analyses),
         "entities": len(entities),
         "edges": len(deduped_edges),
+        "by_language": dict(language_counts),
+        "diagnostics": diagnostics_count,
     }
+
     return RepositoryMemory(
         root_path=str(root),
         indexed_at=datetime.now(UTC).isoformat(),
+        repository_fingerprint=_repository_fingerprint(analyses),
+        analyzers=analyzers,
         entities=entities,
         edges=deduped_edges,
         stats=stats,
     )
 
 
-def _discover_files(root: Path) -> list[Path]:
-    files: list[Path] = []
-    for file_path in root.rglob("*"):
-        if not file_path.is_file():
-            continue
-        if file_path.suffix not in SUPPORTED_EXTENSIONS:
-            continue
-        if any(part in IGNORED_DIRS for part in file_path.parts):
-            continue
-        files.append(file_path)
-    return sorted(files)
+def _analyze_file(root: Path, file_path: Path) -> FileAnalysis:
+    relative_path = file_path.relative_to(root).as_posix()
+    language = SUPPORTED_EXTENSIONS[file_path.suffix]
+    analyzer = ANALYZERS[language]
+    text = file_path.read_text(encoding="utf-8", errors="ignore")
+    return analyzer.analyze(relative_path, text)
 
 
-def _extract_imports(text: str, language: str) -> list[ImportReference]:
-    imports: list[ImportReference] = []
-    if language in {"typescript", "javascript"}:
-        for match in JS_IMPORT_RE.finditer(text):
-            clause = match.group("clause").strip()
-            imports.append(
-                ImportReference(
-                    specifier=match.group("module"),
-                    names=_extract_js_import_names(clause),
-                )
-            )
-        for match in JS_REQUIRE_RE.finditer(text):
-            imports.append(
-                ImportReference(specifier=match.group("module"), names=[match.group("name")])
-            )
-        return imports
-
-    for match in PY_IMPORT_RE.finditer(text):
-        modules = [item.strip() for item in match.group("module").split(",")]
-        for module_name in modules:
-            if not module_name:
-                continue
-            imports.append(ImportReference(specifier=module_name, names=[module_name.split(".")[-1]]))
-    for match in PY_FROM_IMPORT_RE.finditer(text):
-        names = [item.strip().split(" as ")[-1] for item in match.group("names").split(",")]
-        imports.append(ImportReference(specifier=match.group("module"), names=[name for name in names if name]))
-    return imports
+def _build_file_entity(analysis: FileAnalysis) -> Entity:
+    return Entity(
+        id=f"file:{analysis.relative_path}",
+        kind="File",
+        name=Path(analysis.relative_path).name,
+        path=analysis.relative_path,
+        language=analysis.language,
+        summary=_summarize_file(analysis),
+        tags=_derive_tags(analysis.relative_path, Path(analysis.relative_path).stem),
+        hash=analysis.file_hash,
+        qualified_name=analysis.relative_path,
+        module_path=Path(analysis.relative_path).parent.as_posix(),
+        visibility="public",
+        exported=True,
+        metadata={
+            "line_count": analysis.line_count,
+            "byte_size": analysis.byte_size,
+            "diagnostics": analysis.diagnostics,
+        },
+    )
 
 
-def _extract_js_import_names(clause: str) -> list[str]:
-    clause = clause.strip()
-    names: list[str] = []
-    if clause.startswith("{") and clause.endswith("}"):
-        items = clause[1:-1].split(",")
-        for item in items:
-            local = item.strip().split(" as ")[-1].strip()
-            if local:
-                names.append(local)
-        return names
-
-    if "," in clause:
-        default_name, named = clause.split(",", 1)
-        if default_name.strip():
-            names.append(default_name.strip())
-        names.extend(_extract_js_import_names(named.strip()))
-        return names
-
-    cleaned = clause.replace("* as ", "").strip()
-    if cleaned:
-        names.append(cleaned)
-    return names
+def _build_symbol_entity(file_entity: Entity, symbol) -> Entity:
+    return Entity(
+        id=_entity_id(symbol.kind, file_entity.path, symbol.name, symbol.span.start_line),
+        kind=symbol.kind,
+        name=symbol.name,
+        path=file_entity.path,
+        language=file_entity.language,
+        span=symbol.span,
+        signature=symbol.signature,
+        summary=_summarize_symbol(symbol.kind, symbol.name, file_entity.path),
+        tags=_derive_tags(file_entity.path, symbol.name),
+        hash=hashlib.sha256(symbol.body.encode("utf-8")).hexdigest(),
+        qualified_name=f"{file_entity.path}:{symbol.name}",
+        module_path=file_entity.module_path,
+        visibility=symbol.visibility,
+        exported=symbol.exported,
+        metadata={"parent_file": file_entity.id, **symbol.metadata},
+    )
 
 
-def _extract_symbols(text: str, language: str) -> list[RawSymbol]:
-    patterns: list[tuple[re.Pattern[str], str]]
-    if language in {"typescript", "javascript"}:
-        patterns = [
-            (JS_FUNCTION_RE, "Function"),
-            (JS_ARROW_RE, "Function"),
-            (JS_FUNCTION_EXPR_RE, "Function"),
-            (JS_CLASS_RE, "Class"),
-        ]
-    else:
-        patterns = [
-            (PY_FUNCTION_RE, "Function"),
-            (PY_CLASS_RE, "Class"),
-        ]
-
-    symbols: list[RawSymbol] = []
-    seen: set[tuple[str, int]] = set()
-    for pattern, kind in patterns:
-        for match in pattern.finditer(text):
-            name = match.group("name")
-            start_offset = match.start()
-            key = (name, start_offset)
-            if key in seen:
-                continue
-            seen.add(key)
-            signature = match.groupdict().get("signature", "").strip()
-            symbols.append(
-                RawSymbol(
-                    kind=kind,
-                    name=name,
-                    signature=signature,
-                    start_offset=start_offset,
-                    end_offset=_estimate_end_offset(text, start_offset, language),
-                )
-            )
-    return symbols
-
-
-def _estimate_end_offset(text: str, start_offset: int, language: str) -> int:
-    if language in {"typescript", "javascript"}:
-        brace_index = text.find("{", start_offset)
-        if brace_index == -1:
-            line_end = text.find("\n", start_offset)
-            return len(text) if line_end == -1 else line_end
-        depth = 0
-        for offset in range(brace_index, len(text)):
-            char = text[offset]
-            if char == "{":
-                depth += 1
-            elif char == "}":
-                depth -= 1
-                if depth == 0:
-                    return offset + 1
-        return len(text)
-
-    lines = text.splitlines(keepends=True)
-    start_line = _line_number(text, start_offset) - 1
-    base_indent = None
-    offset = 0
-    for line_index, line in enumerate(lines):
-        if line_index < start_line:
-            offset += len(line)
-            continue
-        stripped = line.strip()
-        if line_index == start_line:
-            base_indent = len(line) - len(line.lstrip(" "))
-            offset += len(line)
-            continue
-        if stripped and (len(line) - len(line.lstrip(" "))) <= base_indent:
-            return offset
-        offset += len(line)
-    return len(text)
-
-
-def _resolve_import(current_path: str, specifier: str, root: Path) -> str | None:
+def _resolve_import(current_path: str, specifier: str, root: Path, language: str) -> str | None:
+    if language == "python":
+        return None
     if not specifier.startswith("."):
         return None
 
@@ -417,21 +225,29 @@ def _resolve_import(current_path: str, specifier: str, root: Path) -> str | None
     return None
 
 
-def _summarize_file(relative_path: str, language: str, text: str) -> str:
-    line_count = text.count("\n") + 1 if text else 0
-    parts = relative_path.split("/")
-    area = " / ".join(parts[:-1]) if len(parts) > 1 else "repository root"
-    return f"{language.title()} source file in {area} with approximately {line_count} lines."
+def _repository_fingerprint(analyses: list[FileAnalysis]) -> str:
+    digest = hashlib.sha256()
+    for analysis in sorted(analyses, key=lambda item: item.relative_path):
+        digest.update(f"{analysis.relative_path}:{analysis.file_hash}".encode("utf-8"))
+    return digest.hexdigest()
 
 
-def _summarize_symbol(symbol: RawSymbol, relative_path: str) -> str:
-    readable_name = " ".join(_split_words(symbol.name))
-    return f"{symbol.kind} `{symbol.name}` in {relative_path} related to {readable_name.lower()}."
+def _summarize_file(analysis: FileAnalysis) -> str:
+    area = Path(analysis.relative_path).parent.as_posix() or "repository root"
+    return (
+        f"{analysis.language.title()} source file in {area} with approximately "
+        f"{analysis.line_count} lines and {len(analysis.symbols)} indexed symbols."
+    )
+
+
+def _summarize_symbol(kind: str, name: str, relative_path: str) -> str:
+    readable_name = " ".join(_split_words(name))
+    return f"{kind} `{name}` in {relative_path} related to {readable_name.lower()}."
 
 
 def _derive_tags(relative_path: str, name: str) -> list[str]:
     tokens = {token for token in _split_words(relative_path) + _split_words(name) if token not in STOPWORDS}
-    return sorted(tokens)[:8]
+    return sorted(tokens)[:10]
 
 
 def _split_words(value: str) -> list[str]:
@@ -443,8 +259,8 @@ def _split_words(value: str) -> list[str]:
     return pieces
 
 
-def _line_number(text: str, offset: int) -> int:
-    return text.count("\n", 0, max(offset, 0)) + 1
+def _entity_id(kind: str, path: str, name: str, start_line: int) -> str:
+    return f"{kind.lower()}:{path}:{name}:{start_line}"
 
 
 def _dedupe_edges(edges: list[Edge]) -> list[Edge]:

@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from codemem.deadcode import analyze_dead_code
 from codemem.indexer import index_repository
-from codemem.intent import build_query_packet
 from codemem.models import ChangePlan, Entity, QueryPacket, RepositoryMemory
 from codemem.planner import build_change_plan
+from codemem.retrieval import build_query_packet
 from codemem.store import MemoryStore
 
 
@@ -19,7 +20,7 @@ class CodeMemEngine:
 
     def ensure_memory(self) -> RepositoryMemory:
         memory = self.load_memory()
-        if memory is None:
+        if self.store.needs_refresh(memory):
             memory = self.index_repo()
         return memory
 
@@ -31,28 +32,25 @@ class CodeMemEngine:
     def refresh_memory(self) -> RepositoryMemory:
         return self.index_repo()
 
-    def query_memory(self, prompt: str, limit: int = 12) -> QueryPacket:
-        return build_query_packet(self.ensure_memory(), prompt, limit=limit)
+    def query_memory(self, prompt: str, limit: int = 12, mode: str | None = None) -> QueryPacket:
+        return build_query_packet(self.ensure_memory(), prompt, limit=limit, forced_mode=mode)
 
     def impact_analysis(self, request: str, limit: int = 12) -> QueryPacket:
-        return self.query_memory(request, limit=limit)
+        return self.query_memory(request, limit=limit, mode="impact")
 
     def plan_change(self, request: str, limit: int = 10) -> ChangePlan:
         return build_change_plan(self.ensure_memory(), request, limit=limit)
 
     def get_entity(self, entity_id: str) -> Entity | None:
         memory = self.ensure_memory()
-        for entity in memory.entities:
-            if entity.id == entity_id:
-                return entity
-        return None
+        return next((entity for entity in memory.entities if entity.id == entity_id), None)
 
     def get_neighbors(self, entity_id: str) -> dict[str, object]:
         memory = self.ensure_memory()
         entity = self.get_entity(entity_id)
         if entity is None:
             return {"entity": None, "neighbors": [], "edges": []}
-        neighbors: list[Entity] = []
+
         neighbor_ids = {
             edge.target
             for edge in memory.edges
@@ -62,9 +60,7 @@ class CodeMemEngine:
             for edge in memory.edges
             if edge.target == entity_id
         }
-        for candidate in memory.entities:
-            if candidate.id in neighbor_ids:
-                neighbors.append(candidate)
+        neighbors = [candidate for candidate in memory.entities if candidate.id in neighbor_ids]
         edges = [
             edge.to_dict()
             for edge in memory.edges
@@ -77,24 +73,4 @@ class CodeMemEngine:
         }
 
     def find_dead_code(self) -> dict[str, object]:
-        memory = self.ensure_memory()
-        incoming_calls = {
-            edge.target
-            for edge in memory.edges
-            if edge.kind == "CALLS"
-        }
-        candidates = []
-        for entity in memory.entities:
-            if entity.kind not in {"Function", "Class"}:
-                continue
-            if entity.id in incoming_calls:
-                continue
-            if entity.name in {"main"}:
-                continue
-            candidates.append(entity)
-        candidates.sort(key=lambda item: (item.path, item.start_line or 0, item.name))
-        return {
-            "candidate_count": len(candidates),
-            "candidates": [candidate.to_dict() for candidate in candidates[:50]],
-            "warning": "Dead-code candidates are low confidence until tests and runtime usage confirm them.",
-        }
+        return analyze_dead_code(self.ensure_memory())

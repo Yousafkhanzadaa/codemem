@@ -19,16 +19,17 @@ The goal is not “more context.” The goal is better context.
 
 ## Current capabilities
 
-CodeMem v0.1 supports:
+CodeMem v0.2 supports:
 
 - deterministic indexing for TypeScript, JavaScript, TSX, JSX, and Python files
-- persistent local memory stored in `.codemem/repository_memory.json`
+- persistent local memory stored in `.codemem/repository_memory.json`, with a temp-cache fallback for read-only repositories
 - entity extraction for files, functions, and classes
-- relationship extraction for containment, imports, and conservative call edges
-- hybrid retrieval with typo correction, synonym expansion, and graph-aware neighbor expansion
-- task packets with direct hits, neighbors, coverage, confidence, and reasoning
+- relationship extraction for containment, exports, imports, and conservative call edges
+- analyzer-driven indexing for JavaScript/TypeScript and Python
+- hybrid retrieval with typo correction, synonym expansion, retrieval modes, snippets, graph-aware neighbor expansion, and focused packet compaction
+- task packets with direct hits, primary focus files, deferred sibling matches, neighbors, coverage, confidence, reasoning, and relationship summaries
 - lightweight impact analysis and change planning
-- dead-code candidate discovery
+- dead-code candidate discovery with evidence and confidence buckets
 - a stdio MCP server for MCP-compatible clients
 
 ## Core ideas
@@ -47,9 +48,12 @@ CodeMem is built around a few rules:
 2. Classify the user’s intent from the prompt.
 3. Normalize the query with typo correction and semantic expansion.
 4. Rank relevant entities from memory.
-5. Expand a small graph neighborhood around the best hits.
-6. Return a task packet with:
+5. Compact the results into the smallest useful set of primary files and symbols.
+6. Expand a small graph neighborhood around that focused set.
+7. Return a task packet with:
    - direct hits
+   - focus files
+   - deferred lower-priority matches
    - neighboring entities
    - relationships
    - coverage
@@ -160,17 +164,21 @@ The current MCP server exposes:
 ```text
 src/codemem/
   cli.py        CLI entrypoint
+  deadcode.py   dead-code analysis
   engine.py     high-level application surface
-  indexer.py    deterministic repository indexing
-  intent.py     hybrid retrieval and query understanding
+  indexer.py    analyzer-driven repository indexing
+  intent.py     compatibility wrapper for retrieval
   mcp.py        stdio MCP adapter
   models.py     shared data models
   planner.py    change planning
+  retrieval.py  hybrid retrieval pipeline
   store.py      local memory persistence
+  analyzers/    language analyzers
 
 tests/
   test_engine.py
   test_mcp.py
+  support.py
 ```
 
 ## Verification
@@ -193,9 +201,8 @@ PYTHONPATH=src python3 -m unittest discover -s tests
 
 Planned improvements:
 
-- snippet extraction around matched symbols
-- cleaner reason labels for retrieval matches
 - stronger task-specific retrieval modes
+- richer focus-file summaries for downstream patch planners
 - embedding-backed semantic retrieval
 - safer patch planning and execution
 - language/framework adapters beyond the current baseline

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from codemem.engine import CodeMemEngine
+from codemem.models import ENGINE_VERSION
 
 PROTOCOL_VERSION = "2025-11-25"
 
@@ -39,7 +40,7 @@ class MCPServer:
                 result = {
                     "protocolVersion": PROTOCOL_VERSION,
                     "capabilities": {"tools": {"listChanged": False}},
-                    "serverInfo": {"name": "codemem", "version": "0.1.0"},
+                    "serverInfo": {"name": "codemem", "version": ENGINE_VERSION},
                 }
                 return self._response(request_id, result)
             if method == "notifications/initialized":
@@ -63,7 +64,11 @@ class MCPServer:
         if name == "memory.index_repo":
             payload = self.engine.index_repo().to_dict()
         elif name == "memory.query":
-            payload = self.engine.query_memory(arguments["prompt"], limit=arguments.get("limit", 12)).to_dict()
+            payload = self.engine.query_memory(
+                arguments["prompt"],
+                limit=arguments.get("limit", 12),
+                mode=arguments.get("mode"),
+            ).to_dict()
         elif name == "memory.impact_analysis":
             payload = self.engine.impact_analysis(arguments["request"], limit=arguments.get("limit", 12)).to_dict()
         elif name == "memory.plan_change":
@@ -102,6 +107,10 @@ class MCPServer:
                     "properties": {
                         "prompt": {"type": "string"},
                         "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+                        "mode": {
+                            "type": "string",
+                            "enum": ["locate", "explain", "impact", "modify", "dead_code", "architecture"],
+                        },
                     },
                     "required": ["prompt"],
                     "additionalProperties": False,

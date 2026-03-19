@@ -19,6 +19,12 @@ def build_parser() -> argparse.ArgumentParser:
     query_parser.add_argument("--repo", default=".", help="Repository root")
     query_parser.add_argument("--prompt", required=True, help="Natural-language query")
     query_parser.add_argument("--limit", type=int, default=12)
+    query_parser.add_argument(
+        "--mode",
+        choices=["locate", "explain", "impact", "modify", "dead_code", "architecture"],
+        default=None,
+        help="Optional retrieval mode override",
+    )
 
     plan_parser = subparsers.add_parser("plan", help="Plan a change from repository memory")
     plan_parser.add_argument("--repo", default=".", help="Repository root")
@@ -47,7 +53,7 @@ def main() -> None:
         _print(engine.index_repo().to_dict())
         return
     if args.command == "query":
-        _print(engine.query_memory(args.prompt, limit=args.limit).to_dict())
+        _print(engine.query_memory(args.prompt, limit=args.limit, mode=args.mode).to_dict())
         return
     if args.command == "plan":
         _print(engine.plan_change(args.request, limit=args.limit).to_dict())
